@@ -1,0 +1,39 @@
+{
+  "name": "sol-parts/payum-novapay",
+  "type": "library",
+  "description": "Payum gateway for NovaPay eCommerce acquiring: hosted checkout, hold payments and refunds",
+  "keywords": ["payum", "payment", "novapay", "nova-poshta", "acquiring", "ukraine"],
+  "homepage": "https://sol.parts",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Andrii Didenko",
+      "email": "andrii@didenko.dev"
+    }
+  ],
+  "require": {
+    "php": ">=8.2",
+    "ext-json": "*",
+    "ext-mbstring": "*",
+    "ext-openssl": "*",
+    "payum/core": "^1.7",
+    "php-http/discovery": "^1.14",
+    "psr/http-factory": "^1.0",
+    "psr/http-message": "^1.1|^2.0"
+  },
+  "require-dev": {
+    "nyholm/psr7": "^1.8",
+    "phpunit/phpunit": "^11.5"
+  },
+  "suggest": {
+    "sol-parts/payum-contracts": "Dispatch the shared DoCapture request to settle (complete-hold) held payments"
+  },
+  "autoload": {
+    "psr-4": {
+      "SolParts\\PayumNovaPay\\": ""
+    },
+    "exclude-from-classmap": [
+      "/Tests/"
+    ]
+  }
+}
