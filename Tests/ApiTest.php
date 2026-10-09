@@ -1,7 +1,7 @@
 <?php
 
 /*
- * This file is part of Sol.parts
+ * This file is part of SOLPARTS
  *
  * (c) SOLPARTS LLC (EDRPOU 46143031) <mail@sol.parts>
  *
@@ -78,11 +78,13 @@ final class ApiTest extends TestCase
     {
         [$api, $client] = $this->createRecordingApi(new Response(200, [], '{"id":"sess-1"}'));
 
-        $api->sessionCreate([
+        $session = $api->sessionCreate([
             'client_phone' => '+380000000000',
             'client_email' => '',
             'success_url' => 'https://example.com/done',
         ]);
+
+        self::assertArrayNotHasKey('dropped_fields', $session);
 
         $decoded = \json_decode((string) $client->requests[0]->getBody(), true);
         self::assertArrayNotHasKey('client_email', $decoded);
@@ -117,17 +119,108 @@ final class ApiTest extends TestCase
     }
 
     /**
+     * Реквізит клієнта, який шлюз відхилив як невалідний, не має коштувати клієнту оплати:
+     * сесія створюється вдруге без цього поля, а імʼя поля повертається як слід —
+     * PurchaseAction кладе його в details, щоб менеджер бачив, чому NovaPay не має email
+     * клієнта. Живий випадок — email з домену, який пройшов html5-валідацію форми, але
+     * не пройшов перевірку TLD на боці NovaPay.
+     */
+    public function testRejectedOptionalClientFieldIsDroppedAndSessionRetried(): void
+    {
+        [$api, $client] = $this->createRecordingApi(
+            new Response(400, [], '{"uuid":"x","type":"validation","errors":[{"message":"Invalid email address","code":"invalid_format","path":"client_email"}]}'),
+            new Response(200, [], '{"id":"sess-2","status":"created"}'),
+        );
+
+        $session = $api->sessionCreate([
+            'client_phone' => '+380000000000',
+            'client_first_name' => 'Іван',
+            'client_email' => 'ivan@gmail.xn--com-8cdj3g',
+            'success_url' => 'https://example.com/done',
+        ]);
+
+        self::assertSame(['id' => 'sess-2', 'status' => 'created', 'dropped_fields' => ['client_email']], $session);
+        self::assertCount(2, $client->requests);
+
+        $retry = \json_decode((string) $client->requests[1]->getBody(), true);
+        self::assertArrayNotHasKey('client_email', $retry);
+        self::assertSame('+380000000000', $retry['client_phone']);
+        self::assertSame('Іван', $retry['client_first_name']);
+        self::assertSame('https://example.com/done', $retry['success_url']);
+    }
+
+    /**
+     * Шлюз може називати відхилені поля по одному за раз (валідатор, що зупиняється на
+     * першій помилці). Один повтор тоді впирався б у наступне поле, і клієнт із двома
+     * одруками знову не міг би оплатити. Кожен прохід знімає щось нове; слід — усі
+     * зняті поля разом.
+     */
+    public function testEachRejectedOptionalFieldIsDroppedInTurn(): void
+    {
+        [$api, $client] = $this->createRecordingApi(
+            new Response(400, [], '{"type":"validation","errors":[{"message":"Invalid email address","code":"invalid_format","path":"client_email"}]}'),
+            new Response(400, [], '{"type":"validation","errors":[{"message":"Invalid name","code":"invalid_format","path":"client_first_name"}]}'),
+            new Response(200, [], '{"id":"sess-3"}'),
+        );
+
+        $session = $api->sessionCreate([
+            'client_phone' => '+380000000000',
+            'client_first_name' => '???',
+            'client_last_name' => 'Іваненко',
+            'client_email' => 'ivan@gmail.con',
+        ]);
+
+        self::assertSame(['id' => 'sess-3', 'dropped_fields' => ['client_email', 'client_first_name']], $session);
+        self::assertCount(3, $client->requests);
+
+        $final = \json_decode((string) $client->requests[2]->getBody(), true);
+        self::assertSame(['merchant_id', 'client_phone', 'client_last_name'], \array_keys($final));
+    }
+
+    /**
+     * Знімати можна лише реквізити клієнта. Якби ретрай викидав будь-яке відхилене поле,
+     * відмова по `success_url` дала б сесію БЕЗ адреси повернення: клієнт оплатив би і
+     * завис на сторінці NovaPay, а магазин не отримав би його назад. Тому відмова по
+     * не-droppable полю (URL повернення, телефон) — один запит і виняток нагору з
+     * оригінальним текстом шлюзу.
+     */
+    public function testValidationErrorOnNonDroppableFieldIsNotRetried(): void
+    {
+        [$api, $client] = $this->createRecordingApi(
+            new Response(400, [], '{"type":"validation","errors":[{"message":"Invalid url","code":"invalid_format","path":"success_url"}]}'),
+        );
+
+        try {
+            $api->sessionCreate([
+                'client_phone' => '+380000000000',
+                'client_email' => 'ivan@example.com',
+                'success_url' => 'not a url',
+            ]);
+            self::fail('Очікували LogicException від Api::sessionCreate()');
+        } catch (LogicException $e) {
+            self::assertStringContainsString('Invalid url', $e->getMessage());
+        }
+
+        self::assertCount(1, $client->requests);
+    }
+
+    /**
+     * Відповіді віддаються по черзі — сценарій «відмова, потім повтор» перевіряється
+     * тільки послідовністю. Вичерпана черга падає гучно: прочитаний stream відповіді
+     * назад не перемотується, і повторно віддана відповідь мовчки мала б порожнє тіло.
+     *
      * @return array{0: Api, 1: HttpClientInterface&object{requests: list<RequestInterface>}}
      */
-    private function createRecordingApi(ResponseInterface $response): array
+    private function createRecordingApi(ResponseInterface ...$responses): array
     {
         $psr17 = new Psr17Factory();
 
-        $client = new class($response) implements HttpClientInterface {
+        $client = new class($responses) implements HttpClientInterface {
             /** @var list<RequestInterface> */
             public array $requests = [];
 
-            public function __construct(private readonly ResponseInterface $response)
+            /** @param list<ResponseInterface> $responses */
+            public function __construct(private array $responses)
             {
             }
 
@@ -135,7 +228,8 @@ final class ApiTest extends TestCase
             {
                 $this->requests[] = $request;
 
-                return $this->response;
+                return \array_shift($this->responses)
+                    ?? throw new \LogicException(\sprintf('Відповідь для запиту №%d не задана', \count($this->requests)));
             }
         };
 

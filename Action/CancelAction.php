@@ -1,7 +1,7 @@
 <?php
 
 /*
- * This file is part of Sol.parts
+ * This file is part of SOLPARTS
  *
  * (c) SOLPARTS LLC (EDRPOU 46143031) <mail@sol.parts>
  *

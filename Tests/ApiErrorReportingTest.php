@@ -1,7 +1,7 @@
 <?php
 
 /*
- * This file is part of Sol.parts
+ * This file is part of SOLPARTS
  *
  * (c) SOLPARTS LLC (EDRPOU 46143031) <mail@sol.parts>
  *
@@ -22,6 +22,7 @@ use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use SolParts\PayumNovaPay\Api;
+use SolParts\PayumNovaPay\Exception\NovaPayApiException;
 
 /**
  * Що саме потрапляє в текст винятку, коли NovaPay відповів помилкою.
@@ -87,6 +88,26 @@ final class ApiErrorReportingTest extends TestCase
 
         self::assertStringContainsString('with code "503"', $exception->getMessage());
         self::assertStringContainsString('(empty)', $exception->getMessage());
+    }
+
+    /**
+     * Процесингову відмову NovaPay віддає без `errors[]` — з плоскими `error` і `code`.
+     * Саме за `code` споживач розпізнає «сесії немає» (прострочена сесія на `get-status`),
+     * тож він мусить доїхати у виняток, а не лишитись тільки в тексті повідомлення.
+     */
+    public function testProcessingEnvelopeExposesErrorCode(): void
+    {
+        $exception = $this->captureSessionCreateFailure(new Response(400, [], \json_encode([
+            'uuid' => '00000000-0000-4000-8000-000000000000',
+            'type' => 'processing',
+            'error' => 'database returned no rows',
+            'description' => '',
+            'code' => 'NotFoundError',
+        ], \JSON_THROW_ON_ERROR)));
+
+        self::assertInstanceOf(NovaPayApiException::class, $exception);
+        self::assertSame('NotFoundError', $exception->errorCode);
+        self::assertTrue($exception->isSessionNotFound());
     }
 
     private function captureSessionCreateFailure(ResponseInterface $response): LogicException

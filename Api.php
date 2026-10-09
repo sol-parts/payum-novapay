@@ -1,7 +1,7 @@
 <?php
 
 /*
- * This file is part of Sol.parts
+ * This file is part of SOLPARTS
  *
  * (c) SOLPARTS LLC (EDRPOU 46143031) <mail@sol.parts>
  *
@@ -17,6 +17,7 @@ use Payum\Core\Exception\LogicException;
 use Payum\Core\HttpClientInterface;
 use Psr\Http\Message\RequestFactoryInterface;
 use Psr\Http\Message\StreamFactoryInterface;
+use SolParts\PayumNovaPay\Exception\NovaPayApiException;
 
 /**
  * Клієнт NovaPay eCommerce Acquiring (інтернет-еквайринг НоваПей).
@@ -51,6 +52,17 @@ class Api
     public const STATUS_VOIDED = 'voided';
     /** Термін дії сесії вичерпано. Фінальний неуспіх. */
     public const STATUS_EXPIRED = 'expired';
+
+    /**
+     * Реквізити клієнта, які {@see sessionCreate()} готовий втратити заради самої оплати.
+     *
+     * Це вільний ввід покупця, для `/session` він опційний, і жодна наша логіка на
+     * ньому не тримається — на відміну від `client_phone` (обовʼязковий), URL повернення
+     * та `callback_url` (без них клієнт не вернеться, а магазин не дізнається про оплату).
+     */
+    private const SESSION_DROPPABLE_FIELDS = [
+        'client_first_name', 'client_last_name', 'client_patronymic', 'client_email',
+    ];
 
     private const ENDPOINT_SANDBOX = 'https://api-qecom.novapay.ua/v1';
     private const ENDPOINT_PRODUCTION = 'https://api-ecom.novapay.ua/v1';
@@ -89,24 +101,63 @@ class Api
      * POST /session — ініціює платіжну сесію. Обов'язковий лише `client_phone`
      * (E.164, `+380…`); решта полів клієнта та redirect/callback-URL — опційні.
      *
+     * Опційні реквізити клієнта передаються як best-effort: якщо шлюз відхилить
+     * саме їх, сесія створюється повторно вже без них ({@see SESSION_DROPPABLE_FIELDS}),
+     * а їхні імена повертаються в `dropped_fields` — слід для details транзакції.
+     *
      * @param array<mixed> $details
      *
-     * @return array{id: string, status?: string}
+     * @return array{id: string, status?: string, dropped_fields?: list<string>}
      */
     public function sessionCreate(array $details): array
     {
         $body = ['merchant_id' => $this->merchantId()];
 
         foreach ([
-            'client_phone', 'client_first_name', 'client_last_name', 'client_patronymic',
-            'client_email', 'callback_url', 'success_url', 'fail_url', 'metadata',
+            'client_phone', ...self::SESSION_DROPPABLE_FIELDS,
+            'callback_url', 'success_url', 'fail_url', 'metadata',
         ] as $key) {
             if (isset($details[$key]) && '' !== $details[$key]) {
                 $body[$key] = $details[$key];
             }
         }
 
-        $response = $this->doRequest('/session', $body);
+        // Опційні реквізити клієнта — це те, що покупець набрав руками, і NovaPay
+        // валідує їх суворіше за форму оформлення (email з неіснуючим TLD після
+        // одруку синтаксично валідний, а шлюз його не приймає). Втратити такий
+        // реквізит у сесії дешево, втратити через нього оплату — ні: клієнт
+        // упирається в помилку, і піти платити йому нема куди. Тому відхилені
+        // опційні поля знімаємо і пробуємо ще раз — після 400 сесії не залишилось,
+        // повтор нічого не дублює. Цикл, а не один повтор: шлюз може називати по
+        // одному полю за раз; кожен прохід знімає щось НОВЕ з обмеженого списку,
+        // інакше виняток летить нагору — тож проходів не більше, ніж полів.
+        //
+        // Відмова по будь-чому іншому (підпис, мерчант, телефон, URL повернення)
+        // — наша відповідальність, і вона має долетіти нагору як є.
+        $dropped = [];
+
+        while (true) {
+            try {
+                $response = $this->doRequest('/session', \array_diff_key($body, \array_flip($dropped)));
+                break;
+            } catch (NovaPayApiException $e) {
+                $rejected = $e->invalidFields();
+
+                if ([] === $rejected || [] !== \array_diff($rejected, self::SESSION_DROPPABLE_FIELDS)) {
+                    throw $e;
+                }
+
+                // Лише те, що справді є в тілі і ще не знято: інакше повтор дав би ту саму відмову.
+                $newlyDropped = \array_values(\array_diff(\array_intersect($rejected, \array_keys($body)), $dropped));
+
+                if ([] === $newlyDropped) {
+                    throw $e;
+                }
+
+                $dropped = [...$dropped, ...$newlyDropped];
+            }
+        }
+
         if (!\is_string($response['id'] ?? null) || '' === $response['id']) {
             throw new LogicException('NovaPay: відповідь /session не містить id.');
         }
@@ -114,6 +165,9 @@ class Api
         $result = ['id' => $response['id']];
         if (\is_string($response['status'] ?? null)) {
             $result['status'] = $response['status'];
+        }
+        if ([] !== $dropped) {
+            $result['dropped_fields'] = $dropped;
         }
 
         return $result;
@@ -240,13 +294,13 @@ class Api
         // вироджувалась би у «Syntax error» без коду відповіді й без тіла, хоча реальна
         // причина (throttling, недоступність) стоїть саме в статусі.
         if ($response->getStatusCode() >= 400) {
-            throw new LogicException(\sprintf(
+            throw self::apiError(\sprintf(
                 '%s for "%s" with code "%s". Content: %s.',
                 $response->getReasonPhrase(),
                 $request->getUri(),
                 $response->getStatusCode(),
                 '' === $content ? '(empty)' : self::contentSnippet($content),
-            ));
+            ), $content);
         }
 
         // Успішні void/complete-hold/expire повертають порожнє 200-тіло АБО
@@ -275,6 +329,30 @@ class Api
         }
 
         return $result;
+    }
+
+    /**
+     * Виняток помилкової відповіді. Конверт помилки NovaPay — JSON
+     * `{uuid, type, errors: [{message, code, path}]}` (валідація) або
+     * `{uuid, type, error, code}` (процесинг); розібрані `type`, `errors` і `code`
+     * дають споживачу гілкуватись без парсингу тексту винятку. Не-JSON тіло
+     * (HTML балансувальника) лишає generic LogicException.
+     */
+    private static function apiError(string $message, string $content): LogicException
+    {
+        $decoded = \json_decode($content, true);
+        if (\is_array($decoded) && \is_string($decoded['type'] ?? null)) {
+            $errors = $decoded['errors'] ?? [];
+
+            return new NovaPayApiException(
+                $message,
+                $decoded['type'],
+                \is_array($errors) ? \array_values($errors) : [],
+                \is_string($decoded['code'] ?? null) ? $decoded['code'] : null,
+            );
+        }
+
+        return new LogicException($message);
     }
 
     /**

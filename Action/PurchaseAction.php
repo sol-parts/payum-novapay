@@ -1,7 +1,7 @@
 <?php
 
 /*
- * This file is part of Sol.parts
+ * This file is part of SOLPARTS
  *
  * (c) SOLPARTS LLC (EDRPOU 46143031) <mail@sol.parts>
  *
@@ -97,6 +97,16 @@ abstract class PurchaseAction implements ActionInterface, ApiAwareInterface, Gat
         $session = $this->api->sessionCreate((array) $details);
         $details['session_id'] = $session['id'];
         $details['status'] = $session['status'] ?? Api::STATUS_CREATED;
+
+        // Реквізити, які NovaPay відхилив і сесія створена без них (див. Api::sessionCreate).
+        // Без сліду менеджеру не пояснити, чому шлюз не надіслав клієнту квитанцію на
+        // email із замовлення. Ключ без `_`-префікса навмисно: це факт про сесію, як і
+        // `session_id`, а службові `_`-ключі спільний Payum-extension хоста знімає перед
+        // кожним новим Capture. У тіла запитів він не потрапляє — Api збирає їх за
+        // явними списками полів.
+        if (!empty($session['dropped_fields'])) {
+            $details['dropped_fields'] = $session['dropped_fields'];
+        }
 
         // Точковий мердж (не replace) — щоб зберегти session_id, реквізити клієнта та amount.
         $payment = $this->api->paymentCreate((array) $details);

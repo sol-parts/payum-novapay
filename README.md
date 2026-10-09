@@ -18,9 +18,10 @@ Supported operations:
   customer's funds is released. For a not-yet-paid session it is a no-op —
   the session simply expires on its own.
 - `Refund` — refund of a paid session via `/void`, full session amount.
-- `Notify` — the postback is treated as a sync trigger only: the state is
-  always re-fetched from the NovaPay API (`/get-status`), so a forged
-  callback can at most trigger an extra sync.
+- `Notify` — the postback is treated as a sync trigger: the state is
+  re-fetched from the NovaPay API (`/get-status`), so a forged callback can
+  at most trigger an extra sync. The only exception is session expiry, see
+  the caveats below.
 - `Sync` — re-fetch the session state via `/get-status`.
 - `GetStatus` — maps NovaPay session statuses to Payum ones (see the table
   below).
@@ -151,7 +152,8 @@ and `external_id` with the payment number.
 The only client field NovaPay requires is `client_phone` (E.164, `+380…`);
 `client_first_name`, `client_last_name`, `client_patronymic` and
 `client_email` are optional. The gateway passes them through from the payment
-details supplied by the host application.
+details supplied by the host application, best-effort: see the caveat about
+rejected optional fields below.
 
 The gateway attaches `success_url` / `fail_url` to the long-lived after-URL
 token and `callback_url` to a notify token. NovaPay bakes these URLs into the
@@ -171,14 +173,39 @@ exactly why the redirect target must survive repeated visits.
 - A failed payment attempt does not kill the session: it stays payable until
   it expires, and the capture flow redirects the returning customer back to
   the same payment page for another attempt.
-- The postback body is deliberately not parsed and its signature is not
-  verified: the state is always re-fetched via `/get-status` under the
-  merchant credentials, and the notify URL itself carries an unguessable
-  Payum token.
+- The postback signature is not verified: the state is re-fetched via
+  `/get-status` under the merchant credentials, and the notify URL itself
+  carries an unguessable Payum token.
+- A session lives 30 days. Once it expires unpaid, NovaPay sends an
+  `expired` postback, but `/get-status` no longer returns the session and
+  answers with a "not found" error (`NotFoundError` / `SessionNotFoundError`).
+  Only in this case the postback body is used: when it reports `expired` for
+  the very session the API cannot find, and the last known status is still
+  `created` / `processing`, the session is marked `expired`. Any other "not
+  found" — on a paid or held session, or without a matching `expired`
+  postback — is raised as is, since an expired payment cannot be revived.
 - Successful `/void` and `/complete-hold` calls may answer with an empty body
   or JSON `null` — the gateway treats both as "accepted, no structured body".
 - Error responses are reported with the HTTP status code and a truncated body
-  snippet — balancer errors (429, 5xx) answer with HTML, not JSON.
+  snippet — balancer errors (429, 5xx) answer with HTML, not JSON. When the
+  body is a NovaPay error envelope (`{uuid, type, errors: [{message, code,
+  path}]}` for validation, `{uuid, type, error, code}` for processing) the
+  error is raised as `SolParts\PayumNovaPay\Exception\NovaPayApiException` —
+  a `Payum\Core\Exception\LogicException` exposing `type`, `errors` and
+  `errorCode` — so a consumer can branch on the envelope without parsing the
+  message.
+- Optional client attributes are best-effort. When `/session` answers with a
+  validation error whose `errors[].path` points only at `client_first_name`,
+  `client_last_name`, `client_patronymic` or `client_email`, the session is
+  created again without the rejected fields, repeating while the gateway keeps
+  rejecting further optional fields (at most one pass per field): NovaPay
+  validates them more strictly than a typical checkout form does (a mistyped
+  email domain is enough), and an optional attribute must not cost the
+  customer the payment. A failed `/session` leaves no session behind, so the
+  retry duplicates nothing. The names of the dropped fields are recorded in the
+  payment details as `dropped_fields`, so the merchant can tell why NovaPay has
+  no email for that session. Validation errors touching anything else — and
+  every non-validation error — are raised as is.
 
 ## License
 
